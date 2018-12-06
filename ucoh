@@ -1,0 +1,777 @@
+//============================================================================
+// Name           : DataAlgorithm.cpp
+// Author         : henryalps
+// Version        : v0.1
+// Copyright    : Copyright SNARC(@2014)
+// Description : PPG Signal Process by C++, Ansi-style
+//
+// USAGE         : 使用DataProcess创建一个对象, 并在整段数据处理过程中维护该对象, 使之不被销毁
+//                        使用appendPPGData向对象添加一段32点数据;
+//                        使用getParas得到存储当前HRV参数的一个ParasForReturn型结构体;
+//============================================================================
+#include "DataAlgorithm.h"
+#include "glog/logging.h"
+
+using namespace std;
+
+	DataAlgorithm::DataAlgorithm(int sampleRate, int dataLen){
+		mSampleRate = sampleRate;
+
+		mDataLen = dataLen;
+
+		mWinSize = ceil(sampleRate*WIN_SIZE);
+
+    	mWinShift=floor(sampleRate*SHIFT_SIZE);
+
+    	mList = new List<float>();
+
+    	pListPos = 0;
+
+    	mWinNum = dataLen/mWinShift;
+
+    	mPointLeft = dataLen%mWinShift; // 目前取的dataLen令mPointLeft为0, 所以mPointLent没有在下文中用到.
+
+    	maxPos = -1;
+
+    	max1Pos = -1;
+
+    	lastRShift = 0;
+
+    	winNum = 0;
+
+    	count = 0;
+
+    	mHRVList = new List<float>();
+
+    	mPPGList = NULL;
+
+    	pHRVListPos =0;
+
+    	hrvPosLast=0;
+
+    	filterGen = new float[BL];
+
+    	for(int i=0; i < BL; i++){
+    		filterGen[i] = 0;
+    	}
+
+    	scoreVec = new vector<float>();
+
+    	scoreVec->reserve(6*60); //预分配1min的分数序列长度
+
+    	num = 0;
+
+		num1 = 0;
+
+    	averageMF = 0;
+
+    	averageSDNN = 0;
+
+    	averageSDSD = 0;
+
+    	coherenceHNum = 0;
+
+    	coherenceMNum = 0;
+
+    	coherenceLNum = 0;
+
+    	//+10避免插值后过长的情况
+    	mHRVArray = new float[HRV_WIN_SIZE*_RR_RESAMPLE_RATE+4096];
+
+    	mScoreArray = new float[HRV_WIN_SIZE*_RR_RESAMPLE_RATE];
+
+    	mPPGArray = new float[HRV_WIN_SIZE*mSampleRate];
+
+    	mPSDArray = new float[3];
+
+    	//默认不将当前状态纳入用于计算最终分数的状态序列内
+    	setCalcParasState(false);
+
+    	validScoreCount = 0; // 有效分数个数初始化
+
+    	numfreq = 0;
+
+    	numsdsd = 0;
+
+    	numsdnn = 0;
+
+    	hasNew = false;
+
+		//初始状态时所有因子的置信度都应该为1
+		lastLfStd = -1;
+
+		lastSdnnStd = -1;
+
+		lastSdsdStd = -1;
+	}
+
+	int DataAlgorithm::appendPPGData(float data[]){ // data[]的长度与mDataLen保持一致
+		if (data == NULL){
+			hasNew = false;
+			return -1;
+		}
+		//float len = 0;
+		int lastMaxPos;
+		int shift = 0; // 最大值在窗口内的偏移
+		float interval = -1;
+		int maxPPGLen = HRV_WIN_SIZE*mSampleRate; // PPG窗口的最大长度
+
+		// 用于计算本组数据的极差
+		float maxPPGVal = data[0];
+		float minPPGVal = data[0];
+		// 进行滤波
+		for (int i=0; i<mDataLen; i++){
+			if (data[i]>maxPPGVal)
+			{
+				maxPPGVal = data[i];
+			}
+			if (data[i]<minPPGVal)
+			{
+				minPPGVal = data[i];
+			}
+			filter(data[i]);
+			if (mPPGList == NULL){ // 初始化: 用ppgListLen存储其长度, 避免长链表长度查询所带来的时间复杂度
+				mPPGList = new List<float>();
+				ppgListLen = 1;
+				mPPGList->Insert(ppgListLen, data[i]);
+				pPPGListPos = 2;
+			} else{
+				if(pPPGListPos >maxPPGLen){
+					pPPGListPos = 1;
+					mPPGList->SetData(pPPGListPos, data[i]);
+				}else{
+					if(ppgListLen == maxPPGLen){
+						mPPGList->SetData(pPPGListPos, data[i]);
+					}else{
+						mPPGList->Insert(ppgListLen,data[i]);
+					}
+				}
+				pPPGListPos++;
+				ppgListLen = ppgListLen< maxPPGLen- 1?ppgListLen+1:maxPPGLen;
+			}
+		}
+		// 如果发现本组数据为杂波, 则直接返回
+		if (maxPPGVal - minPPGVal < UNNORMAL_STANDARD)
+		{
+			hasNew = false;
+			return -1;
+		}
+
+		for(int i=0;i<mWinNum;i++){
+			lastMaxPos = maxPos;
+
+			winShift(data+i*mWinShift);
+			if(lastMaxPos == maxPos && mList->Length()>=mWinSize){ // 在列表长度达到窗口长度时才开始计数
+ 				count++;
+				shift = (maxPos>=pListPos)?(maxPos-pListPos):(mWinSize+maxPos-pListPos-1);
+			}else{
+				if(count>=mWinShift){ // 发现了一个主波峰值(认为一段data内最多出现一个主波峰值)
+					//interval = mWinSize - lastRShift -1 + winNum*mWinSize + shift;
+					interval = winNum*mWinShift + shift-lastRShift;
+					lastRShift = shift;
+					winNum=0;
+				}
+				count=0;
+			}
+			winNum++;
+		}
+		if(interval!=-1 && interval<=RRI_MAX * mSampleRate && interval >= RRI_MIN * mSampleRate){ 
+			// 加入HRV队列, 根据队列中的数据总时长确定是否需要扩展队列
+			// 对HRV取值的范围进行验证, 抛弃非法值
+			if(mHRVList->sum <HRV_WIN_SIZE*mSampleRate){
+				mHRVList->Insert(mHRVList->Length(), interval);
+			}else{
+				mHRVList->SetData((pHRVListPos++)%(mHRVList->Length())+1,interval);
+			}
+			hasNew = true;
+		}else{
+			hasNew = false;
+		}
+		return interval;
+	}
+
+	int DataAlgorithm::winShift(float data[]){ // data[]的长度与mWinShift保持一致
+		int i = 0;
+		int diff = mWinSize - mList->Length(); // 窗口还余下多少可用空间
+		if (diff >= mWinShift){ // 窗口仍有超过mWinShift的剩余空间数
+			for(;i<mWinShift;i++){
+				mList->Insert(mList->Length(), data[i]);
+				if(maxPos == -1){
+					maxPos = i;
+					max = data[i];
+				}else{
+					if(data[i]>max){
+						maxPos = mList->Length() -1;
+						max = data[i];
+					}
+				}
+				if(mList->Length()>mWinShift){
+					if(max1Pos == -1){
+						max1Pos = mList->Length() - 1;
+						max1 = data[i];
+					}else{
+						if(data[i]>max1){
+							max1Pos = mList->Length() -1;
+							max1 = data[i];
+						}
+					}
+				}
+			}
+		}else if(diff>0){ // 鉴于所取的dataLen, 此种情形不可能出现
+			if(DEBUG){
+				cout<<"impossible"<<endl;
+			}
+			while(mList->Length()<mWinSize){
+				mList->Insert(mList->Length(),data[i++]);
+			}
+			int j=1;
+			while(i<mWinShift){
+				mList->SetData(j++,data[i++]);
+			}
+			pListPos = j%mWinSize  - 1;// setData()的起始位置是1而数组的起始位置是0
+		}else{
+			int pos;
+			if(maxPos != max1Pos){ // 上一个最大值的位置位于被覆盖的区域内
+				maxPos = max1Pos;
+				max = max1;
+			}
+			while(i<mWinShift){
+				pos = (pListPos+i)%mWinSize + 1;
+				mList->SetData(pos, data[i]);
+				if(max < data[i]){
+					max = data[i];
+					maxPos = pos-1;
+				}
+				i++;
+			}
+			pListPos = (pListPos+i)%mWinSize;
+			if(maxPos < pListPos + mWinShift && maxPos>=pListPos){ // 最大值处于即将被覆盖的区域内
+				int j = mWinShift;
+				float value;
+				max1Pos = -1;
+				for(;j<mWinSize;j++){
+					pos = (pListPos+ j)%mWinSize + 1;
+					mList->GetData(pos,value);
+					if(max1Pos == -1){
+						max1Pos = pos-1;
+						max1 = value;
+					}else{
+						if(value>max1){
+							max1=value;
+							max1Pos = pos-1;
+						}
+					}
+				}
+			}else{
+				max1 = max;
+				max1Pos = maxPos;
+			}
+		}
+		return 0;
+	}
+
+
+	/**
+	 * timeLen: 返回HRV与滤波后PPG的窗口时长,单位s, timeLen的最大值由common.h中的HRV_WIN_SIZE定义;
+	 * 当timeLen超出HRV_WIN_SIZE时, 只会返回前HRV_WIN_SIZE秒中的HRV与滤波后PPG;
+	 * 返回的HRV是经过插值之后的, 重采样频率固定为common.h中的_RR_RESAMPLE_RATE.
+	 */
+	ParasForReturn DataAlgorithm::getParas(int timeLen){
+		ParasForReturn parasForReturn;
+		parasForReturn.sdnn=0;
+		parasForReturn.sdsd=0;
+		parasForReturn.score=0;
+		parasForReturn.lf=0;
+		parasForReturn.mf=0;
+		parasForReturn.hf=0;
+		parasForReturn.scorelen=-1;
+		parasForReturn.rrlen = 0;
+		parasForReturn.coherenceH = 0;
+		parasForReturn.coherenceM = 0;
+		parasForReturn.coherenceL = 0;
+		parasForReturn.psd = mPSDArray;
+		parasForReturn.ppg = mPPGArray;
+		parasForReturn.rr = mHRVArray;
+		parasForReturn.score = mScoreArray;
+
+		parasForReturn.hasNew = false;
+		parasForReturn.ppgNewLen = 0;
+		parasForReturn.rrNew = 0;
+		parasForReturn.scoreNew = 0;
+
+		int ppgPointNum = timeLen*mSampleRate;
+		if(ppgListLen<1)
+			return parasForReturn;
+		//pPPGListPos%=ppgListLen;
+		//pPPGListPos++;
+
+		mPPGList->GetArray(pPPGListPos,ppgPointNum,1,mPPGArray);
+		parasForReturn.ppglen=ppgPointNum<ppgListLen?ppgPointNum:ppgListLen;
+
+		int len = mHRVList->Length();
+		if(len<1)
+			return parasForReturn;
+        int headPointPos = pHRVListPos%len+1;
+
+		int pointNum = timeLen*_RR_RESAMPLE_RATE;
+		float sum = 0;
+		float* array = new float[len];
+		mHRVList->GetArray(headPointPos,len,mSampleRate,array,sum);
+
+		int hrvLen =(int)(floor (sum - array[0])*_RR_RESAMPLE_RATE) + 1 ; //插值后的HRV序列长度
+
+		parasForReturn.rrlen = hrvLen;
+
+		float *x; //插值后的横坐标序列(目前未使用到)
+		float lfhf[5]; //从小到大依次为0-0.08Hz 0.08-0.15Hz 0.15-0.40Hz 0-0.40Hz能量总和 0.04-0.15Hz
+		GetRRinfo(array, len, x, parasForReturn.rr,  lfhf); // lfhf[0]: lf lfhf[1]: mf lfhf[2]: hf lfhf[3]: all
+		free(x);
+		// 返回各频段功率谱分量在总功率谱积分中所占比例, 如果总功率谱积分为0, 则令各频段功率谱分量所占比例相同
+		if(lfhf[3] == 0){
+			parasForReturn.psd[0] = 1.0/3;
+			parasForReturn.psd[1] = parasForReturn.psd[0];
+			parasForReturn.psd[2] = parasForReturn.psd[1];
+		}else{
+			parasForReturn.psd[0] = lfhf[0]/lfhf[3];
+			parasForReturn.psd[1] = lfhf[1]/lfhf[3];
+			parasForReturn.psd[2] = lfhf[2]/lfhf[3];
+		}
+		int timeParasWinLen = _STD_GUIDE_BREATH_LEN*_RR_RESAMPLE_RATE; // 计算sdsd与sdnn所用的窗口长度
+		int timeWinNum = hrvLen / timeParasWinLen; // 窗口数
+		int i, j;
+
+		// 标准计算sdsd与sdnn的方法
+		parasForReturn.sdnn=0;
+		parasForReturn.sdsd=0;
+		int tmpLen = 0;
+		float sumPoint = 0;
+		timeWinNum = 0;
+		for (int i=len-1; i>0; i--)
+		{
+			sumPoint+=array[i];
+			tmpLen++;
+			if (sumPoint>=_STD_GUIDE_BREATH_LEN) // 长度达到10s
+			{
+				parasForReturn.sdnn += deviation(array+i,tmpLen);
+				float* newAssistArray = new float[tmpLen - 1];
+				for (j=0; j<tmpLen-1; j++)
+				{
+					newAssistArray[j] = abs(array[i+j+1] - array[i+j]);
+				}
+				parasForReturn.sdsd+=deviation(newAssistArray, tmpLen-1);
+				timeWinNum++;
+				sumPoint = 0;
+				tmpLen = 0;
+				delete[] newAssistArray;
+				newAssistArray = NULL;
+			}
+		}
+		if (timeWinNum>1)
+		{
+			parasForReturn.sdnn /= timeWinNum;
+			parasForReturn.sdnn *= 1000; // 单位转为ms
+			parasForReturn.sdsd /= timeWinNum;
+			parasForReturn.sdsd *= 1000; // 单位转为ms
+
+			averageSDNN += parasForReturn.sdnn;
+			averageSDSD += parasForReturn.sdsd;
+			num1++;
+		}
+
+		// 如果timeLen对应的数据长度短于rr的长度, 需要对rr进行截取
+		if(hrvLen>pointNum){
+			parasForReturn.rr+=hrvLen-pointNum;
+			parasForReturn.rrlen = pointNum;
+		}
+
+		// 长度不足以计算两个频域参数, 则返回
+		if(hrvLen < FREQ_WIN_LEN*_RR_RESAMPLE_RATE){
+			return parasForReturn;
+		}
+		parasForReturn.lf=lfhf[0];
+		parasForReturn.mf=lfhf[1];
+		parasForReturn.hf=lfhf[2];
+		i=1;
+
+		// 在长度能够计算两个频域参数后, 开始计算分数计算所需参数
+		if(num<REFERENCE_DATA_LEN){
+			num++;
+			//averageMF+=lfhf[4];
+			// MF比例
+			averageMF += parasForReturn.mf / (parasForReturn.mf + parasForReturn.lf );
+			averageSDNN+=parasForReturn.sdnn;
+			averageSDSD+=parasForReturn.sdsd;
+		}else if(num == REFERENCE_DATA_LEN){
+			averageMF/=num;
+			averageSDNN/=(num+num1);
+			averageSDSD/=(num+num1);
+			parasForReturn.scorelen=0; // 可以开始训练过程了
+			num++;
+		}else{ // 数据采集过程已经结束, 开始计算分数
+			float score = 0;
+			// 该变量存储的是测量量相对于基准量增加的幅度
+			// MF比例的增长比例
+			float scoreStandard = parasForReturn.mf / ((parasForReturn.mf + parasForReturn.lf ) * averageMF) ;
+			if (lastLfStd != -1) // 根据本次分数与上次分数的偏差对结果进行修正
+			{
+				if (abs(lastLfStd - scoreStandard) >=2 )// 超过置信范围，则重置
+				{
+					scoreStandard = lastLfStd;
+				}else if(abs(lastLfStd - scoreStandard) >=1 ){
+					scoreStandard = scoreStandard*(2-abs(lastLfStd-scoreStandard)) + lastLfStd*(abs(lastLfStd-scoreStandard) - 1 );
+				}
+			}
+			lastLfStd = scoreStandard;
+
+			if(scoreStandard >= 3){
+				score+=numfreq>=60?numfreq:numfreq++;
+			}else if(scoreStandard > 1) {
+				score += (scoreStandard - 1) * 30; // 加权比例为6
+			}else{
+				if(numfreq>60*SWIFT_SCALE){
+					numfreq--;
+				}
+			}
+
+			LOG(INFO)<<"**PARA1:"<<scoreStandard;
+
+			scoreStandard = parasForReturn.sdnn/averageSDNN;
+			if (lastSdnnStd != -1) 
+			{
+				if (abs(lastSdnnStd - scoreStandard) >=1 )
+				{
+					scoreStandard = lastSdnnStd;
+				}else if(abs(lastSdnnStd - scoreStandard) >=0.5 ){
+					scoreStandard = scoreStandard*(2-abs(lastSdnnStd-scoreStandard)) + lastSdnnStd*(abs(lastSdnnStd-scoreStandard) - 1 );
+				}
+			}
+			// 修正了阈值
+			lastSdnnStd = scoreStandard;
+			if(scoreStandard >= 2){
+				score+=numsdnn>=20?numsdnn:numsdnn++;
+			}else if(scoreStandard > 0.5) {
+				score += abs(scoreStandard - 1) * 20; // 加权比例为2
+				if(numsdnn>20*SWIFT_SCALE){
+					numsdnn--;
+				}
+			}else{
+				score += abs(scoreStandard - 1) * 20; // 加权比例为2
+			}
+			LOG(INFO)<<"**PARA2:"<<scoreStandard;
+
+			scoreStandard = parasForReturn.sdsd/averageSDSD;
+			if (lastSdsdStd != -1) 
+			{
+				if (abs(lastSdsdStd - scoreStandard) >=1 )
+				{
+					scoreStandard = lastSdsdStd;
+				}else if(abs(lastSdsdStd - scoreStandard) >=0.5 ){
+					scoreStandard = scoreStandard*(2-abs(lastSdsdStd-scoreStandard)) + lastSdsdStd*(abs(lastSdsdStd-scoreStandard) - 1 );
+				}
+			}
+			lastSdsdStd = scoreStandard;
+			if(scoreStandard >= 2){
+				score+=numsdsd>=20?numsdsd:numsdsd++;
+			}else if(scoreStandard > 0.5)
+				score += abs(1 - scoreStandard) * 20; // 加权比例为2
+				if(numsdsd>20*SWIFT_SCALE){
+					numsdsd--;
+				}
+			else{
+				score += (1 - scoreStandard)  * 20;
+			}
+
+
+			LOG(INFO)<<"**PARA3:"<<scoreStandard;
+			// 改用(mf)/(lf+mf+hf)
+			if (abs(lfhf[3] - 0) < 0.00001)
+			{
+				coherenceLNum++;
+			}else{
+				float coh = parasForReturn.mf / (parasForReturn.mf+parasForReturn.hf + parasForReturn.lf);
+				if (coh >= 0.3)
+				{
+					coherenceHNum++;
+				} 
+				else if (coh >= 0.2)
+				{
+					coherenceMNum++;
+				}
+				else
+				{
+					coherenceLNum++;
+				}
+			}
+			float sum = coherenceHNum + coherenceMNum + coherenceLNum;
+			parasForReturn.coherenceH = coherenceHNum/sum;
+			parasForReturn.coherenceM = coherenceMNum/sum;
+			parasForReturn.coherenceL = coherenceLNum/sum;
+
+			// 判断是否要将这个分数插入分数队列中.
+			if((hrvPosLast != pHRVListPos)){
+				if(getCalcParasState() && score >= 0){
+					validScoreCount++; // 这个分数值属于有效分数
+					scoreVec->push_back(score); // 将能计入最终参数运算队列的score映射到+score
+				}else{
+					if(score == 0){
+						score = 101; // 将不能计入最终参数运算队列的0值映射到-101
+					}
+					scoreVec->push_back(-score);// 将不能计入最终参数运算队列的score映射到-score
+				}
+			}
+			hrvPosLast = pHRVListPos;
+			int veclen = scoreVec->size();
+			parasForReturn.scorelen = veclen>parasForReturn.rrlen?parasForReturn.rrlen:veclen;
+			vector<float>::iterator it = scoreVec->begin() + (veclen>parasForReturn.rrlen?veclen-parasForReturn.rrlen:0);
+			for(i=0;it!=scoreVec->end();it++){
+				parasForReturn.score[i++] = (abs(*it)==101)?0:abs(*it); // 还原映射
+			}
+		}
+
+		parasForReturn.ppgNewLen = mDataLen;
+		parasForReturn.ppgNew = parasForReturn.ppg + parasForReturn.ppglen - parasForReturn.ppgNewLen;
+		if(hasNew){
+			parasForReturn.hasNew = true;
+		    parasForReturn.rrNew = array[len-1]*mSampleRate;
+			if (parasForReturn.score[i-1] >= 0)
+			{
+				parasForReturn.scoreNew = parasForReturn.score[i - 1];
+			}else{
+				parasForReturn.scoreNew = 0;
+			}
+		}
+		delete[] array;
+
+		return parasForReturn;
+				
+	}
+
+	/*设置是否用当前收到的数据计算FinalParas*/
+	void DataAlgorithm::setCalcParasState(bool calcParasOrNot){
+		calcParasState = calcParasOrNot;
+	}
+
+	/*判断当前的数据是否用于计算FinalParas*/
+	bool DataAlgorithm::getCalcParasState(){
+		return calcParasState;
+	}
+
+	/*每次训练完成后调用*/
+	FinalParas DataAlgorithm::getFinalParas(){
+		FinalParas finalParas;
+		finalParas.finalScore = 0;
+		finalParas.adjustmentAbility = 100;
+		finalParas.stability = 0;
+
+		const int breathNumLimit = 10;// 呼吸次数限制(次). 若经过这段时间仍未计算出调节能力值, 则令其取值为0
+		const int breathPointsNum = _STD_GUIDE_BREATH_LEN ;// 一次呼吸评分点数, 由于分数采样率为1, 因此与呼吸时间相同
+		const int threshold = 50;// 如果没在呼吸时间限制内发现分数0值点,采用第一个取值小于阈值的点的位置作为判断起始位置
+
+		int limitedScoreLen  = breathNumLimit*_STD_GUIDE_BREATH_LEN; // 呼吸次数限制内的点数
+		int i  = 0 , j = 0;
+		int firstZeroPos = -1;// 第一个零值点的位置
+		int smallThanThresholdPos = -1;// 第一个小于阈值的点的位置
+		float sita = 10;// 20个点的标准差
+		float tmp;
+		float maxScore = 0, minScore = 0;
+		int maxScorePos = 0, minScorePos = 0;
+		float meanScore = 0;// 平均分数, 用于计算总分
+
+		float* array = new float[validScoreCount]; // 存储分数数组
+
+		vector<float>::iterator it = scoreVec->begin();
+		/*将数据存储到数组, 并求计算起始位置与分数序列最大值*/
+		while(it != scoreVec->end()){
+			tmp = *it;
+			if(tmp<0){
+				it++;
+				//return finalParas;
+				continue;
+			}
+			if (i<limitedScoreLen) {
+				if ( firstZeroPos == -1 && tmp==0 && (i<validScoreCount-1) && *(it+1) != 0) {
+					firstZeroPos = i;
+				}
+				if ( smallThanThresholdPos==-1 && firstZeroPos == -1 &&  tmp<threshold ) {
+					smallThanThresholdPos = i;
+				}
+			}
+			if (tmp > maxScore) {
+				maxScore = tmp;
+				maxScorePos = i;
+			}
+			if(tmp < minScore)
+			{
+				minScore = tmp;
+				minScorePos = i;
+			}
+			meanScore += *it;
+			array[i] = *it;
+			i++;
+			it++;
+
+		}
+		validScoreCount=i;
+		meanScore /= validScoreCount; // 得到平均分
+
+		if ((firstZeroPos == -1 && smallThanThresholdPos==-1)|| validScoreCount < limitedScoreLen + breathPointsNum) { // 分数值一直较高, 直接计算调节能力
+			finalParas.adjustmentAbility = (maxScorePos == minScorePos)?0:
+					((1-abs(maxScorePos - minScorePos)/scoreVec->size() )* abs(maxScore - minScore) );
+		}else{
+					firstZeroPos = firstZeroPos!=-1?firstZeroPos:smallThanThresholdPos;
+					float tenPointSum = 0; // 10点的和, 用于迭代计算均值
+					float mean ;// 计算标准差时用到的均值
+					for (i=0; i < breathPointsNum ; i++) {
+						tenPointSum += array[firstZeroPos+i];
+					}
+					tenPointSum/=breathPointsNum;
+					while (firstZeroPos+j<limitedScoreLen && sita>5 && array[firstZeroPos+j]<maxScore*0.9) {
+						mean = tenPointSum/breathPointsNum;
+						sita = 0;
+						for (i = 0;  i< breathPointsNum; i++) {
+							sita+=(array[firstZeroPos+i+j]-mean)*(array[firstZeroPos+i+j]-mean);
+						}
+						sita/=breathPointsNum;
+						sita=(float)sqrt(sita);
+						j++;
+						// 计算下一个均值
+						tenPointSum-=array[firstZeroPos+j-1];
+						tenPointSum+=array[firstZeroPos+breathPointsNum+j-1];
+					}
+					if (firstZeroPos+j>=limitedScoreLen) {
+						finalParas.adjustmentAbility= 5+ 15.0*rand()/RAND_MAX;
+					}else {
+						finalParas.adjustmentAbility=(float) (((20-floor(j/20.0))/20-((i%20)/400))*array[firstZeroPos+j]);// 计算调节能力
+					}
+					j+=firstZeroPos;
+				}
+				// 开始计算稳定系数
+				// 修正validScoreCount不合法时结果为负数的问题
+				if (j<validScoreCount)
+				{
+					for (i = j; i < validScoreCount; i++) {
+						finalParas.stability+=array[i]>=0?(100-abs(array[i]-array[i-1]))*array[i]/100:0;
+					}
+					finalParas.stability/=(validScoreCount-j+1);
+				}else if(validScoreCount != 0){
+					for (i = 0;i < validScoreCount; i++)
+					{
+						finalParas.stability+=array[i]>=0?(100-abs(array[i]-array[i-1]))*array[i]/100:0;
+					}
+					finalParas.stability/=validScoreCount;
+				}
+				if (finalParas.stability<0)
+				{
+					finalParas.stability = 0;
+				}
+		/*计算总分: 平均分40% 稳定性和调节能力各30%*/
+		finalParas.finalScore = 0.4*meanScore + 0.3*(finalParas.stability + finalParas.adjustmentAbility);
+
+		delete[] array;
+		return finalParas;
+	}
+
+	DataAlgorithm::~DataAlgorithm(){
+		delete mList;
+		mList = NULL;
+		delete mHRVList;
+		mHRVList = NULL;
+		if (mPPGList != NULL)
+		{
+			delete mPPGList;
+			mPPGList = NULL;
+		}
+		delete filterGen;
+		filterGen = NULL;
+		delete[] mPPGArray;
+		mPPGArray = NULL;
+		scoreVec->clear();
+		delete scoreVec;
+		scoreVec = NULL;
+		delete[] mScoreArray;
+		mScoreArray = NULL;
+		delete[] mPSDArray;
+		mPSDArray =NULL;
+		delete[] mHRVArray;
+		mHRVArray = NULL;
+	}
+
+	// 计算标准差
+	float DataAlgorithm::deviation(float f[], int size) {
+		int i;
+		float average = 0, s = 0;
+		for (i = 0; i < size; i++) {
+			average += f[i];
+		}
+
+		average /= size; //平均值
+
+		for (i = 0; i < size; i++) {
+			s += pow(f[i] - average, 2); // 偏离平均数的距离和
+		}
+
+		s = s / size; //方差
+		s = sqrt(s); //标准差
+
+		return s;
+	}
+
+	/**
+	 * 输入val为队列当前位置值的引用
+	 * 50Hz陷波器为一四阶FIR滤波器, 所以只需要存储x值.
+	 */
+	void DataAlgorithm::filter(float &val){
+		if(NEED_50HZ_FILTER){
+			float tmp;// 滤波器用
+			tmp = 0;
+			for(int j=BL-1; j>0;j--){
+				filterGen[j] = filterGen[j-1];
+				tmp+=filterGen[j]*B[j];
+			}
+			filterGen[0] = val;
+			val = tmp + val*B[0];
+		}
+	}
+
+	/************************************************************************/
+	/* 重置算法中发生更新的变量                                                                  */
+	/************************************************************************/
+	void DataAlgorithm::reset()
+	{
+		count = 0;
+		pListPos = 0;
+		maxPos = -1;
+		max1Pos = -1;
+		lastRShift = 0;
+		winNum = 0;
+		pHRVListPos =0;
+		hrvPosLast=0;
+		num = 0;
+		num1 = 0;
+		averageMF = 0;
+		averageSDNN = 0;
+		averageSDSD = 0;
+		coherenceHNum = 0;
+		coherenceMNum = 0;
+		coherenceLNum = 0;
+		validScoreCount = 0;
+		numfreq = 0;
+		numsdsd = 0;
+		numsdnn = 0;
+		lastLfStd = -1;
+		lastSdnnStd = -1;
+		lastSdsdStd = -1;
+		hasNew = false;
+		for(int i=0; i < BL; i++){
+			filterGen[i] = 0;
+		}
+		if (mPPGList!=NULL)
+		{
+			delete mPPGList;
+			mPPGList = NULL;
+		}
+		mHRVList->makeEmpty();
+		mList->makeEmpty();
+		scoreVec->clear();
+		scoreVec->reserve(6*60);
+	}
