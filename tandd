@@ -1,0 +1,68 @@
+function [RTD,RFD]=HRVTandF(RR)
+%Time domain analysis of HRV
+%average of RR(unit:ms)
+TD.avnn = mean(RR)*1000;
+% average heart rate(unit:bpm)
+TD.meanHR = 60/(TD.avnn/1000);
+% sdnn(unit:ms)
+TD.sdnn = std(RR)*1000;
+% standard deviation of heart rate
+TD.sdhr = std(60./(RR));
+% rmssd(unit:ms)
+TD.rmssd = sqrt(sum((diff(RR*1000)).^2)/(length(RR)-1));
+% NNxx,number of defferences between adjacent RR intervals that are greater
+% than xx ms,need to set vaule of xx
+% pNNxx,percentage of defferences between adjacent RR intervals that are
+% greater than xx ms
+xx = 50;
+TD.NNxx = sum(abs(diff(RR*1000))>xx);
+TD.pNNxx = TD.NNxx/(length(RR)-1);
+RTD = [TD.avnn,TD.meanHR,TD.sdnn,TD.sdhr,TD.rmssd,TD.NNxx,TD.pNNxx];
+%Frequency domain analysis of HRV
+% set the default values for the RR interpolation rate of 4Hz
+fs = 2;
+% points in frequency - domain
+fd = 256 ;
+% number of fft
+nfft = 256*fs;
+% interpolation 
+rsum = 0;
+for i = 1:length(RR)
+    rsum = rsum + RR(i);
+    t_rr(i) = rsum;
+end
+x = RR(1):1/fs:rsum;
+interp = interp1(t_rr,RR,x,'spline');
+x_interp = interp - mean(interp);
+% AR model to estimate the PSD of the series
+para = ar(x_interp,16,'fb');
+[h,fp] = freqz(1,para.a,nfft,'whole',fs);
+psd = para.NoiseVariance*1000000*abs(h).^2/2;
+psd(1) = psd(1)/2;
+FD.PSD = psd;
+%分频段
+vlf = 0.04;
+lf = 0.15;
+hf = 0.4;
+coh1 = 0.08;
+coh2 = 0.125;
+coh1index = find(fp>coh1);
+coh2index = find(fp>coh2);
+FD.TOT=sum(psd./fd);
+FD.Coh = sum(psd(coh1index(1):(coh2index(1)-1))./fd)/sum(psd./fd);
+vlfindex = find(fp>vlf);
+lfindex = find(fp>lf);
+hfindex = find(fp>hf );
+FD.VLF = sum(psd(1:(vlfindex(1)-1))./fd);
+FD.LF  = sum(psd(vlfindex(1):(lfindex(1)-1))./fd);
+FD.HF = sum(psd(lfindex(1):(hfindex(1)-1))./fd);
+FD.peakVLF = fp(find(psd(1:length(psd)/2) == max(psd(1:(vlfindex(1)-1)))));
+FD.peakLF = fp(find(psd(1:length(psd)/2) == max(psd(vlfindex(1):(lfindex(1)-1)))));
+FD.peakHF = fp(find(psd(1:length(psd)/2)==max(psd(lfindex(1):(hfindex(1)-1)))));
+totalpower = FD.VLF + FD.LF + FD.HF;
+FD.pVLF = FD.VLF/totalpower;
+FD.pLF = FD.LF/totalpower;
+FD.pHF = FD.HF/totalpower;
+FD.LFHF = FD.LF/FD.HF;
+RFD = [FD.TOT,FD.Coh,FD.VLF,FD.LF,FD.HF,FD.peakVLF,FD.peakLF,FD.peakHF,FD.pVLF,FD.pLF,FD.pHF,FD.LFHF];
+end
